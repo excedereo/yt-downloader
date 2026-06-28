@@ -148,6 +148,7 @@ def ensure_deno():
 app = FastAPI()
 
 YT_RE = re.compile(r"(youtube\.com|youtu\.be)", re.I)
+MAX_DURATION = 15 * 60   # лимит длительности видео, секунд (15 минут)
 
 
 def safe_name(s: str) -> str:
@@ -183,49 +184,35 @@ async def info(url: str):
         return JSONResponse({"error": str(e)[:300]}, status_code=500)
 
 
-@app.get("/api/download")
-async def download(url: str, fmt: str = "video", quality: str = "720"):
-    """Скачивает и отдаёт файл. fmt = video|audio; quality = 360|720|1080|best."""
-    if not YT_RE.search(url or ""):
-        return JSONResponse({"error": "Это не похоже на ссылку YouTube"}, status_code=400)
-
-    job = DL_DIR / uuid.uuid4().hex
-    job.mkdir()
-    outtmpl = str(job / "%(title)s.%(ext)s")
-
+def build_opts(job: Path, fmt: str, quality: str, progress_hook=None):
+    """Собирает опции yt-dlp для скачивания в папку job."""
     opts = {
-        "outtmpl": outtmpl,
+        "outtmpl": str(job / "%(title)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "restrictfilenames": False,
-        # разрешаем yt-dlp тянуть EJS-скрипты (решают YouTube-challenge через Deno)
-        "remote_components": ["ejs:github"],
-        # устойчивость к обрывам на длинных видео ("read operation timed out"):
-        "socket_timeout": 60,          # больше ждём медленные фрагменты
-        "retries": 10,                 # ретраи при ошибке
-        "fragment_retries": 10,        # ретраи отдельных фрагментов
-        "http_chunk_size": 10485760,   # качаем чанками по 10 МБ (стабильнее)
+        "remote_components": ["ejs:github"],   # EJS-скрипты для YouTube-challenge (Deno)
+        # устойчивость к обрывам на длинных видео:
+        "socket_timeout": 60,
+        "retries": 10,
+        "fragment_retries": 10,
+        "http_chunk_size": 10485760,
         "concurrent_fragment_downloads": 4,
     }
+    if progress_hook:
+        opts["progress_hooks"] = [progress_hook]
     if FFMPEG_DIR:
         opts["ffmpeg_location"] = FFMPEG_DIR
 
     if fmt == "audio":
         opts["format"] = "bestaudio/best"
         opts["postprocessors"] = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
+            "key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192",
         }]
     else:
-        # предпочитаем mp4/m4a (AAC-звук), чтобы файл играл в любом плеере, включая
-        # стандартный Windows. fallback на любой формат с перекодировкой звука в AAC.
         if quality == "best":
-            opts["format"] = (
-                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo+bestaudio/best"
-            )
+            opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
         else:
             q = re.sub(r"\D", "", quality) or "720"
             opts["format"] = (
@@ -233,36 +220,96 @@ async def download(url: str, fmt: str = "video", quality: str = "720"):
                 f"bestvideo[height<={q}]+bestaudio/best[height<={q}]/best"
             )
         opts["merge_output_format"] = "mp4"
-        # если звук пришёл в Opus/Vorbis — перекодируем в AAC при склейке
+        # звук в AAC при склейке (Opus не играет в Windows-плеере)
         opts["postprocessor_args"] = {"merger": ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]}
-
-    def _run():
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            return info
-
-    try:
-        await asyncio.to_thread(_run)
-    except Exception as e:
-        shutil.rmtree(job, ignore_errors=True)
-        return JSONResponse({"error": str(e)[:300]}, status_code=500)
-
-    files = [p for p in job.iterdir() if p.is_file()]
-    if not files:
-        shutil.rmtree(job, ignore_errors=True)
-        return JSONResponse({"error": "Файл не создан"}, status_code=500)
-    f = max(files, key=lambda p: p.stat().st_size)
-
-    # отдаём файл; чистим папку после отправки
-    return FileResponse(
-        f, filename=f.name, media_type="application/octet-stream",
-        background=_cleanup(job),
-    )
+    return opts
 
 
 def _cleanup(job: Path):
     from starlette.background import BackgroundTask
     return BackgroundTask(lambda: shutil.rmtree(job, ignore_errors=True))
+
+
+@app.get("/api/prepare")
+async def prepare(url: str, fmt: str = "video", quality: str = "720"):
+    """SSE-стрим: качает с реальным прогрессом, в конце отдаёт job_id+имя файла.
+    События: data: {"percent": N} ... data: {"done": true, "job": "...", "filename": "..."}
+    или data: {"error": "..."}"""
+    from fastapi.responses import StreamingResponse
+    import json
+
+    if not YT_RE.search(url or ""):
+        async def err():
+            yield 'data: ' + json.dumps({"error": "Это не похоже на ссылку YouTube"}) + '\n\n'
+        return StreamingResponse(err(), media_type="text/event-stream")
+
+    loop = asyncio.get_event_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    job = DL_DIR / uuid.uuid4().hex
+
+    def hook(d):
+        # вызывается из рабочего потока yt-dlp — пробрасываем прогресс в очередь
+        if d.get("status") == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            done = d.get("downloaded_bytes") or 0
+            pct = (done / total * 100) if total else 0
+            loop.call_soon_threadsafe(queue.put_nowait, {"percent": round(pct, 1)})
+        elif d.get("status") == "finished":
+            # фрагмент/файл докачан — идёт склейка/постобработка
+            loop.call_soon_threadsafe(queue.put_nowait, {"percent": 100, "stage": "merge"})
+
+    def worker():
+        try:
+            # проверка длительности перед скачиванием
+            with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True, "noplaylist": True,
+                                   "remote_components": ["ejs:github"]}) as ydl:
+                meta = ydl.extract_info(url, download=False)
+            dur = meta.get("duration") or 0
+            if dur > MAX_DURATION:
+                loop.call_soon_threadsafe(queue.put_nowait, {
+                    "error": f"Видео длиннее {MAX_DURATION // 60} минут — лимит сервиса"})
+                return
+            job.mkdir(exist_ok=True)
+            with yt_dlp.YoutubeDL(build_opts(job, fmt, quality, hook)) as ydl:
+                ydl.extract_info(url, download=True)
+            files = [p for p in job.iterdir() if p.is_file()]
+            if not files:
+                loop.call_soon_threadsafe(queue.put_nowait, {"error": "Файл не создан"})
+                return
+            f = max(files, key=lambda p: p.stat().st_size)
+            loop.call_soon_threadsafe(queue.put_nowait,
+                                      {"done": True, "job": job.name, "filename": f.name})
+        except Exception as e:
+            shutil.rmtree(job, ignore_errors=True)
+            loop.call_soon_threadsafe(queue.put_nowait, {"error": str(e)[:300]})
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)  # сигнал конца
+
+    asyncio.ensure_future(asyncio.to_thread(worker))
+
+    async def stream():
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield 'data: ' + json.dumps(item) + '\n\n'
+
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/file/{job_id}")
+async def get_file(job_id: str):
+    """Отдаёт готовый файл по job_id и чистит папку после отправки."""
+    if not re.fullmatch(r"[0-9a-f]{32}", job_id or ""):
+        return JSONResponse({"error": "bad job"}, status_code=400)
+    job = DL_DIR / job_id
+    files = [p for p in job.iterdir() if p.is_file()] if job.exists() else []
+    if not files:
+        return JSONResponse({"error": "Файл не найден или уже скачан"}, status_code=404)
+    f = max(files, key=lambda p: p.stat().st_size)
+    return FileResponse(f, filename=f.name, media_type="application/octet-stream",
+                        background=_cleanup(job))
 
 
 # ── фронт (одна страница, без сборки) ──
@@ -300,10 +347,16 @@ PAGE = r"""<!DOCTYPE html>
   .meta .u{font-size:12px;color:var(--gray);margin-top:3px}
   .status{margin-top:14px;font-size:13px;color:var(--gray);min-height:18px;text-align:center}
   .err{color:var(--accent)}
+  .pbar{margin-top:16px;display:none;background:#101015;border:1px solid var(--line);
+    border-radius:10px;overflow:hidden;height:24px;position:relative}
+  .pbar-fill{height:100%;width:0%;background:linear-gradient(90deg,var(--accent),var(--accent2));
+    transition:width .3s ease}
+  .pbar-txt{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    font-size:12px;font-weight:700;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.5)}
 </style></head><body>
 <div class="card">
   <h1>YT Downloader</h1>
-  <div class="sub">Вставь ссылку на YouTube — скачай видео или аудио <span style="opacity:.5">· v2</span></div>
+  <div class="sub">Вставь ссылку на YouTube — скачай видео или аудио <span style="opacity:.5">· v3</span></div>
   <input type="text" id="url" placeholder="https://youtube.com/watch?v=...">
   <div class="row">
     <div class="seg" id="fmt">
@@ -319,6 +372,7 @@ PAGE = r"""<!DOCTYPE html>
   </div>
   <div class="meta" id="meta"><img id="thumb"><div><div class="t" id="mtitle"></div><div class="u" id="muploader"></div></div></div>
   <button class="go" id="go">Скачать</button>
+  <div class="pbar" id="pbar"><div class="pbar-fill" id="pfill"></div><div class="pbar-txt" id="ptxt">0%</div></div>
   <div class="status" id="status"></div>
 </div>
 <script>
@@ -348,25 +402,34 @@ $('#url').addEventListener('input',()=>{
   },600);
 });
 function fmtDur(s){const m=Math.floor(s/60),x=s%60;return m+':'+String(x).padStart(2,'0');}
-$('#go').onclick=async()=>{
+function setProg(p,stage){
+  $('#pbar').style.display='block';
+  $('#pfill').style.width=p+'%';
+  $('#ptxt').textContent=stage==='merge'?'Склейка...':(p.toFixed(0)+'%');
+}
+$('#go').onclick=()=>{
   const u=$('#url').value.trim();
   if(!u){setStatus('Вставь ссылку',true);return;}
-  $('#go').disabled=true;setStatus('Качаю... это может занять минуту');
+  $('#go').disabled=true;setStatus('');
+  $('#pbar').style.display='block';$('#pfill').style.width='0%';$('#ptxt').textContent='0%';
   const q=$('#quality').value;
-  const link='/api/download?url='+encodeURIComponent(u)+'&fmt='+fmt+'&quality='+q;
-  try{
-    const r=await fetch(link);
-    if(!r.ok){const d=await r.json().catch(()=>({}));setStatus(d.error||'Ошибка',true);$('#go').disabled=false;return;}
-    const blob=await r.blob();
-    const cd=r.headers.get('content-disposition')||'';
-    let name='download';
-    let m=cd.match(/filename\*=UTF-8''([^;]+)/i);   // RFC 5987 (приоритет)
-    if(m){try{name=decodeURIComponent(m[1]);}catch(e){name=m[1];}}
-    else{m=cd.match(/filename="?([^";]+)"?/i);if(m)name=m[1];}
-    const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();
-    setStatus('Готово ✓');
-  }catch(e){setStatus('Ошибка сети',true);}
-  $('#go').disabled=false;
+  const es=new EventSource('/api/prepare?url='+encodeURIComponent(u)+'&fmt='+fmt+'&quality='+q);
+  es.onmessage=ev=>{
+    let d;try{d=JSON.parse(ev.data);}catch(e){return;}
+    if(d.error){es.close();setStatus(d.error,true);$('#pbar').style.display='none';$('#go').disabled=false;return;}
+    if(d.percent!=null)setProg(d.percent,d.stage);
+    if(d.done){
+      es.close();
+      // файл готов на сервере — забираем по job_id
+      const a=document.createElement('a');
+      a.href='/api/file/'+d.job;a.download=d.filename||'download';
+      document.body.appendChild(a);a.click();a.remove();
+      setProg(100);$('#ptxt').textContent='Готово ✓';
+      setStatus('Готово ✓ — файл скачивается');
+      $('#go').disabled=false;
+    }
+  };
+  es.onerror=()=>{es.close();setStatus('Ошибка соединения',true);$('#pbar').style.display='none';$('#go').disabled=false;};
 };
 function setStatus(t,err){const s=$('#status');s.textContent=t;s.className='status'+(err?' err':'');}
 </script>
