@@ -239,7 +239,7 @@ def _cleanup(job: Path):
 
 
 # ── фронт (одна страница, без сборки) ──
-PAGE = """<!DOCTYPE html>
+PAGE = r"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>YT Downloader</title>
