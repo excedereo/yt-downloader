@@ -1,0 +1,5 @@
+downloads/
+bin/
+__pycache__/
+*.pyc
+.local/
