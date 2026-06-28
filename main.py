@@ -66,6 +66,37 @@ def ensure_ffmpeg():
         return None
 
 
+def ensure_deno():
+    """yt-dlp требует JS-runtime для парсинга YouTube (иначе видео без звука).
+    Ставим Deno в bin/ и добавляем в PATH, если его нет в системе."""
+    if shutil.which("deno"):
+        print("[deno] найден в системе", flush=True)
+        return
+    local = BIN_DIR / "deno"
+    if not local.exists():
+        # официальный статик-бинарник Deno (linux x64)
+        url = "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip"
+        print("[deno] не найден — качаю...", flush=True)
+        try:
+            import zipfile
+            tmp = BIN_DIR / "deno.zip"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req) as r, open(tmp, "wb") as f:
+                shutil.copyfileobj(r, f)
+            with zipfile.ZipFile(tmp) as z:
+                z.extract("deno", BIN_DIR)
+            os.chmod(local, 0o755)
+            tmp.unlink(missing_ok=True)
+            print("[deno] установлен в", local, flush=True)
+        except Exception as e:
+            print("[deno] не удалось установить:", e, flush=True)
+            print("[deno] видео может качаться без звука", flush=True)
+            return
+    # добавляем bin/ в PATH, чтобы yt-dlp нашёл deno
+    os.environ["PATH"] = str(BIN_DIR) + os.pathsep + os.environ.get("PATH", "")
+    print("[deno] добавлен в PATH", flush=True)
+
+
 app = FastAPI()
 
 YT_RE = re.compile(r"(youtube\.com|youtu\.be)", re.I)
@@ -274,6 +305,7 @@ function setStatus(t,err){const s=$('#status');s.textContent=t;s.className='stat
 
 if __name__ == "__main__":
     ensure_ffmpeg()
+    ensure_deno()
     port = int(os.environ.get("SERVER_PORT") or os.environ.get("PORT") or 25748)
     print(f"[start] слушаю 0.0.0.0:{port}", flush=True)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
