@@ -266,7 +266,7 @@ PAGE = """<!DOCTYPE html>
 </style></head><body>
 <div class="card">
   <h1>YT Downloader</h1>
-  <div class="sub">Вставь ссылку на YouTube — скачай видео или аудио</div>
+  <div class="sub">Вставь ссылку на YouTube — скачай видео или аудио <span style="opacity:.5">· v2</span></div>
   <input type="text" id="url" placeholder="https://youtube.com/watch?v=...">
   <div class="row">
     <div class="seg" id="fmt">
