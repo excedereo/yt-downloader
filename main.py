@@ -2,6 +2,10 @@
 YT Downloader — простой веб-сервис скачивания видео/аудio с YouTube.
 FastAPI + yt-dlp. Рассчитан на запуск в Pterodactyl (LifeHosting): слушает
 0.0.0.0:$SERVER_PORT, ffmpeg при отсутствии докачивается статик-бинарником.
+
+Само-обновление: при старте тянет свою свежую версию из репо и перезапускается
+на ней. Поэтому достаточно один раз залить файл — дальше пуш в репо + рестарт
+сервера и код обновится сам, без git на хостинге.
 """
 
 import os
@@ -13,6 +17,32 @@ import asyncio
 import tarfile
 import urllib.request
 from pathlib import Path
+
+# ── само-обновление из репо (до тяжёлых импортов, на голом stdlib) ──
+RAW_URL = "https://raw.githubusercontent.com/excedereo/yt-downloader/main/main.py"
+
+
+def self_update():
+    """Качает свежий main.py из репо. Если отличается — пишет и перезапускается."""
+    if os.environ.get("NO_SELF_UPDATE") == "1" or "--updated" in sys.argv:
+        return
+    try:
+        me = Path(__file__).resolve()
+        req = urllib.request.Request(RAW_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            fresh = r.read()
+        current = me.read_bytes()
+        if fresh and fresh != current and b"YT Downloader" in fresh:
+            me.write_bytes(fresh)
+            print("[update] main.py обновлён из репо, перезапускаюсь", flush=True)
+            os.execv(sys.executable, [sys.executable, str(me), "--updated"])
+        else:
+            print("[update] уже актуальная версия", flush=True)
+    except Exception as e:
+        print("[update] пропускаю (нет связи с репо):", e, flush=True)
+
+
+self_update()
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
