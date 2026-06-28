@@ -149,7 +149,8 @@ async def info(url: str):
         return JSONResponse({"error": "Это не похоже на ссылку YouTube"}, status_code=400)
 
     def _extract():
-        with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True, "noplaylist": True}) as ydl:
+        with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True, "noplaylist": True,
+                               "remote_components": ["ejs:github"]}) as ydl:
             return ydl.extract_info(url, download=False)
 
     try:
@@ -180,6 +181,8 @@ async def download(url: str, fmt: str = "video", quality: str = "720"):
         "quiet": True,
         "no_warnings": True,
         "restrictfilenames": False,
+        # разрешаем yt-dlp тянуть EJS-скрипты (решают YouTube-challenge через Deno)
+        "remote_components": ["ejs:github"],
     }
     if FFMPEG_DIR:
         opts["ffmpeg_location"] = FFMPEG_DIR
