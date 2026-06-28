@@ -23,23 +23,41 @@ RAW_URL = "https://raw.githubusercontent.com/excedereo/yt-downloader/main/main.p
 
 
 def self_update():
-    """Качает свежий main.py из репо. Если отличается — пишет и перезапускается."""
+    """Тянет свежий main.py через git (без CDN-кэша raw) и перезапускается, если отличается.
+
+    raw.githubusercontent кэшируется CDN до ~5 минут и отдавал старьё. git берёт
+    напрямую из репо, всегда актуальный. Клонируем repo в .repo/ и копируем main.py.
+    """
     if os.environ.get("NO_SELF_UPDATE") == "1" or "--updated" in sys.argv:
         return
+    import subprocess
+    me = Path(__file__).resolve()
+    repo_url = "https://github.com/excedereo/yt-downloader"
+    repo_dir = me.parent / ".repo"
     try:
-        me = Path(__file__).resolve()
-        req = urllib.request.Request(RAW_URL, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            fresh = r.read()
+        if (repo_dir / ".git").exists():
+            subprocess.run(["git", "-C", str(repo_dir), "fetch", "--depth", "1", "origin", "main"],
+                           check=True, capture_output=True, timeout=30)
+            subprocess.run(["git", "-C", str(repo_dir), "reset", "--hard", "origin/main"],
+                           check=True, capture_output=True, timeout=30)
+        else:
+            subprocess.run(["git", "clone", "--depth", "1", repo_url, str(repo_dir)],
+                           check=True, capture_output=True, timeout=60)
+        fresh_path = repo_dir / "main.py"
+        fresh = fresh_path.read_bytes()
         current = me.read_bytes()
         if fresh and fresh != current and b"YT Downloader" in fresh:
             me.write_bytes(fresh)
-            print("[update] main.py обновлён из репо, перезапускаюсь", flush=True)
+            print("[update] main.py обновлён из git, перезапускаюсь", flush=True)
             os.execv(sys.executable, [sys.executable, str(me), "--updated"])
         else:
             print("[update] уже актуальная версия", flush=True)
+    except subprocess.CalledProcessError as e:
+        print("[update] git ошибка:", (e.stderr or b"").decode()[:200], flush=True)
+    except FileNotFoundError:
+        print("[update] git не установлен — пропускаю", flush=True)
     except Exception as e:
-        print("[update] пропускаю (нет связи с репо):", e, flush=True)
+        print("[update] пропускаю:", e, flush=True)
 
 
 self_update()
