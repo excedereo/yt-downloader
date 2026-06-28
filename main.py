@@ -192,12 +192,22 @@ async def download(url: str, fmt: str = "video", quality: str = "720"):
             "preferredquality": "192",
         }]
     else:
+        # предпочитаем mp4/m4a (AAC-звук), чтобы файл играл в любом плеере, включая
+        # стандартный Windows. fallback на любой формат с перекодировкой звука в AAC.
         if quality == "best":
-            opts["format"] = "bestvideo+bestaudio/best"
+            opts["format"] = (
+                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo+bestaudio/best"
+            )
         else:
             q = re.sub(r"\D", "", quality) or "720"
-            opts["format"] = f"bestvideo[height<={q}]+bestaudio/best[height<={q}]/best"
+            opts["format"] = (
+                f"bestvideo[height<={q}][ext=mp4]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={q}]+bestaudio/best[height<={q}]/best"
+            )
         opts["merge_output_format"] = "mp4"
+        # если звук пришёл в Opus/Vorbis — перекодируем в AAC при склейке
+        opts["postprocessor_args"] = {"merger": ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]}
 
     def _run():
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -322,7 +332,10 @@ $('#go').onclick=async()=>{
     if(!r.ok){const d=await r.json().catch(()=>({}));setStatus(d.error||'Ошибка',true);$('#go').disabled=false;return;}
     const blob=await r.blob();
     const cd=r.headers.get('content-disposition')||'';
-    let name=decodeURIComponent((cd.match(/filename\\*?=(?:UTF-8'')?\"?([^\";]+)/)||[])[1]||'download');
+    let name='download';
+    let m=cd.match(/filename\*=UTF-8''([^;]+)/i);   // RFC 5987 (приоритет)
+    if(m){try{name=decodeURIComponent(m[1]);}catch(e){name=m[1];}}
+    else{m=cd.match(/filename="?([^";]+)"?/i);if(m)name=m[1];}
     const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();
     setStatus('Готово ✓');
   }catch(e){setStatus('Ошибка сети',true);}
