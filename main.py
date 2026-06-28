@@ -201,6 +201,12 @@ async def download(url: str, fmt: str = "video", quality: str = "720"):
         "restrictfilenames": False,
         # разрешаем yt-dlp тянуть EJS-скрипты (решают YouTube-challenge через Deno)
         "remote_components": ["ejs:github"],
+        # устойчивость к обрывам на длинных видео ("read operation timed out"):
+        "socket_timeout": 60,          # больше ждём медленные фрагменты
+        "retries": 10,                 # ретраи при ошибке
+        "fragment_retries": 10,        # ретраи отдельных фрагментов
+        "http_chunk_size": 10485760,   # качаем чанками по 10 МБ (стабильнее)
+        "concurrent_fragment_downloads": 4,
     }
     if FFMPEG_DIR:
         opts["ffmpeg_location"] = FFMPEG_DIR
