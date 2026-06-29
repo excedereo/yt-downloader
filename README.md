@@ -1,26 +1,33 @@
 # YT Downloader
 
-Простой веб-сервис скачивания видео/аудио с YouTube. FastAPI + yt-dlp.
+Сервис скачивания видео/аудио с YouTube. FastAPI + yt-dlp.
 
-## Запуск (LifeHosting / Pterodactyl, Python 3.12+)
+Это **модуль для [vaeli-hub](https://github.com/excedereo/vaeli-hub)** — сам по
+себе не запускается. Hub втягивает этот репозиторий в `services/yt/` через
+GitHub Actions и монтирует на префикс `/yt` (и домен `yt.vaelira.su`).
 
-В настройках сервера (вкладка «Запуск»):
+## Состав
 
-- **GIT REPO ADDRESS:** `https://github.com/excedereo/yt-downloader`
-- **Дополнительные пакеты Python:** `yt-dlp fastapi uvicorn`
-- **Образ Docker:** Python 3.12+
-
-Сервер слушает `0.0.0.0:$SERVER_PORT` (порт берётся из окружения панели).
-Открывается по `http://IP:ПОРТ`.
-
-## ffmpeg
-
-Нужен для mp3 и качества выше 720p. Если в системе нет — `main.py` сам докачает
-статическую сборку в `bin/` при первом старте.
-
-## Локально
-
-```bash
-pip install -r requirements.txt
-python main.py    # http://localhost:25748
 ```
+__init__.py   контракт Service для ядра hub
+router.py     роуты (/api/info, /api/prepare, /api/file) + фронт (PAGE)
+requirements.txt
+```
+
+## Что умеет
+
+- видео (360/720/1080/макс) и аудио (mp3)
+- метаданные по ссылке (превью, длительность, автор)
+- реальный прогресс скачивания через SSE
+- лимит 15 минут на длительность
+- звук в AAC (Opus не играет в стандартном Windows-плеере)
+
+## Зависимости
+
+`yt-dlp`, `fastapi`, `uvicorn`. Плюс ffmpeg и deno — их докачивает hub
+(объявлены в `Service.needs`).
+
+## Разработка
+
+Правишь здесь → пушишь → GitHub Action в hub втягивает свежую версию в
+`services/yt/` и коммитит. Перезагрузка сервера подхватывает обновление.

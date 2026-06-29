@@ -1,122 +1,39 @@
 """
-YT Downloader — простой веб-сервис скачивания видео/аудio с YouTube.
-FastAPI + yt-dlp. Рассчитан на запуск в Pterodactyl (LifeHosting): слушает
-0.0.0.0:$SERVER_PORT, ffmpeg при отсутствии докачивается статик-бинарником.
+YT Downloader — скачивание видео/аудио с YouTube. FastAPI + yt-dlp.
 
-Обновление кода — через git pull самого хостинга (AUTO_UPDATE в панели):
-пуш в репо + перезагрузка сервера.
+Сервис hub: отдаёт APIRouter, монтируется ядром на префикс /yt.
+ffmpeg/deno докачиваются ядром через shared.binaries (объявлены в needs).
 """
 
-import os
 import re
-import sys
 import uuid
 import shutil
 import asyncio
-import tarfile
-import urllib.request
+import json
 from pathlib import Path
 
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
-import uvicorn
+from fastapi import APIRouter
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, StreamingResponse
 import yt_dlp
 
+from shared import binaries
+
+router = APIRouter()
+
 BASE = Path(__file__).resolve().parent
-DL_DIR = BASE / "downloads"        # сюда качаем
-BIN_DIR = BASE / "bin"             # сюда кладём ffmpeg если докачали
+DL_DIR = BASE / "downloads"
 DL_DIR.mkdir(exist_ok=True)
-BIN_DIR.mkdir(exist_ok=True)
-
-# ── ffmpeg: ищем в системе, иначе докачиваем статический бинарник ──
-FFMPEG_DIR = None  # папка с ffmpeg/ffprobe для yt-dlp (--ffmpeg-location)
-
-
-def ensure_ffmpeg():
-    """Возвращает путь к папке с ffmpeg или None, если он есть в PATH."""
-    global FFMPEG_DIR
-    if shutil.which("ffmpeg"):
-        print("[ffmpeg] найден в системе", flush=True)
-        return None
-    local = BIN_DIR / "ffmpeg"
-    if local.exists():
-        print("[ffmpeg] уже докачан в bin/", flush=True)
-        FFMPEG_DIR = str(BIN_DIR)
-        return FFMPEG_DIR
-    # докачиваем статическую сборку (johnvansickle, linux x64)
-    url = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
-    print("[ffmpeg] не найден — качаю статик-сборку...", flush=True)
-    try:
-        tmp = BIN_DIR / "ffmpeg.tar.xz"
-        urllib.request.urlretrieve(url, tmp)
-        with tarfile.open(tmp) as t:
-            for m in t.getmembers():
-                name = os.path.basename(m.name)
-                if name in ("ffmpeg", "ffprobe"):
-                    m.name = name
-                    t.extract(m, BIN_DIR)
-        os.chmod(local, 0o755)
-        ffprobe = BIN_DIR / "ffprobe"
-        if ffprobe.exists():
-            os.chmod(ffprobe, 0o755)
-        tmp.unlink(missing_ok=True)
-        FFMPEG_DIR = str(BIN_DIR)
-        print("[ffmpeg] докачан в", FFMPEG_DIR, flush=True)
-        return FFMPEG_DIR
-    except Exception as e:
-        print("[ffmpeg] не удалось докачать:", e, flush=True)
-        print("[ffmpeg] mp3 и качество >720p будут недоступны", flush=True)
-        return None
-
-
-def ensure_deno():
-    """yt-dlp требует JS-runtime для парсинга YouTube (иначе видео без звука).
-    Ставим Deno в bin/ и добавляем в PATH, если его нет в системе."""
-    if shutil.which("deno"):
-        print("[deno] найден в системе", flush=True)
-        return
-    local = BIN_DIR / "deno"
-    if not local.exists():
-        # официальный статик-бинарник Deno (linux x64)
-        url = "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip"
-        print("[deno] не найден — качаю...", flush=True)
-        try:
-            import zipfile
-            tmp = BIN_DIR / "deno.zip"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req) as r, open(tmp, "wb") as f:
-                shutil.copyfileobj(r, f)
-            with zipfile.ZipFile(tmp) as z:
-                z.extract("deno", BIN_DIR)
-            os.chmod(local, 0o755)
-            tmp.unlink(missing_ok=True)
-            print("[deno] установлен в", local, flush=True)
-        except Exception as e:
-            print("[deno] не удалось установить:", e, flush=True)
-            print("[deno] видео может качаться без звука", flush=True)
-            return
-    # добавляем bin/ в PATH, чтобы yt-dlp нашёл deno
-    os.environ["PATH"] = str(BIN_DIR) + os.pathsep + os.environ.get("PATH", "")
-    print("[deno] добавлен в PATH", flush=True)
-
-
-app = FastAPI()
 
 YT_RE = re.compile(r"(youtube\.com|youtu\.be)", re.I)
 MAX_DURATION = 15 * 60   # лимит длительности видео, секунд (15 минут)
 
 
-def safe_name(s: str) -> str:
-    s = re.sub(r"[^\w\s.-]", "", s, flags=re.U).strip()
-    return (s or "video")[:120]
-
-
-@app.get("/", response_class=HTMLResponse)
+@router.get("/", response_class=HTMLResponse)
 def index():
     return PAGE
 
 
-@app.get("/api/info")
+@router.get("/api/info")
 async def info(url: str):
     """Метаданные по ссылке: название, длительность, превью."""
     if not YT_RE.search(url or ""):
@@ -148,7 +65,6 @@ def build_opts(job: Path, fmt: str, quality: str, progress_hook=None):
         "no_warnings": True,
         "restrictfilenames": False,
         "remote_components": ["ejs:github"],   # EJS-скрипты для YouTube-challenge (Deno)
-        # устойчивость к обрывам на длинных видео:
         "socket_timeout": 60,
         "retries": 10,
         "fragment_retries": 10,
@@ -157,8 +73,8 @@ def build_opts(job: Path, fmt: str, quality: str, progress_hook=None):
     }
     if progress_hook:
         opts["progress_hooks"] = [progress_hook]
-    if FFMPEG_DIR:
-        opts["ffmpeg_location"] = FFMPEG_DIR
+    if binaries.FFMPEG_DIR:
+        opts["ffmpeg_location"] = binaries.FFMPEG_DIR
 
     if fmt == "audio":
         opts["format"] = "bestaudio/best"
@@ -185,14 +101,9 @@ def _cleanup(job: Path):
     return BackgroundTask(lambda: shutil.rmtree(job, ignore_errors=True))
 
 
-@app.get("/api/prepare")
+@router.get("/api/prepare")
 async def prepare(url: str, fmt: str = "video", quality: str = "720"):
-    """SSE-стрим: качает с реальным прогрессом, в конце отдаёт job_id+имя файла.
-    События: data: {"percent": N} ... data: {"done": true, "job": "...", "filename": "..."}
-    или data: {"error": "..."}"""
-    from fastapi.responses import StreamingResponse
-    import json
-
+    """SSE-стрим: качает с реальным прогрессом, в конце отдаёт job_id+имя файла."""
     if not YT_RE.search(url or ""):
         async def err():
             yield 'data: ' + json.dumps({"error": "Это не похоже на ссылку YouTube"}) + '\n\n'
@@ -203,19 +114,16 @@ async def prepare(url: str, fmt: str = "video", quality: str = "720"):
     job = DL_DIR / uuid.uuid4().hex
 
     def hook(d):
-        # вызывается из рабочего потока yt-dlp — пробрасываем прогресс в очередь
         if d.get("status") == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             done = d.get("downloaded_bytes") or 0
             pct = (done / total * 100) if total else 0
             loop.call_soon_threadsafe(queue.put_nowait, {"percent": round(pct, 1)})
         elif d.get("status") == "finished":
-            # фрагмент/файл докачан — идёт склейка/постобработка
             loop.call_soon_threadsafe(queue.put_nowait, {"percent": 100, "stage": "merge"})
 
     def worker():
         try:
-            # проверка длительности перед скачиванием
             with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True, "noplaylist": True,
                                    "remote_components": ["ejs:github"]}) as ydl:
                 meta = ydl.extract_info(url, download=False)
@@ -238,7 +146,7 @@ async def prepare(url: str, fmt: str = "video", quality: str = "720"):
             shutil.rmtree(job, ignore_errors=True)
             loop.call_soon_threadsafe(queue.put_nowait, {"error": str(e)[:300]})
         finally:
-            loop.call_soon_threadsafe(queue.put_nowait, None)  # сигнал конца
+            loop.call_soon_threadsafe(queue.put_nowait, None)
 
     asyncio.ensure_future(asyncio.to_thread(worker))
 
@@ -253,7 +161,7 @@ async def prepare(url: str, fmt: str = "video", quality: str = "720"):
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-@app.get("/api/file/{job_id}")
+@router.get("/api/file/{job_id}")
 async def get_file(job_id: str):
     """Отдаёт готовый файл по job_id и чистит папку после отправки."""
     if not re.fullmatch(r"[0-9a-f]{32}", job_id or ""):
@@ -440,7 +348,7 @@ $('#url').addEventListener('input',()=>{
 
 async function fetchInfo(u){
   try{
-    const r=await fetch('/api/info?url='+encodeURIComponent(u));
+    const r=await fetch('api/info?url='+encodeURIComponent(u));
     const d=await r.json();
     if(d.error){infoState='error';setStatus(d.error,'err');refreshBtn();return;}
     curDur=d.duration||0;
@@ -495,7 +403,7 @@ $('#go').onclick=()=>{
   const u=$('#url').value.trim();
   $('#go').disabled=true;$('#golabel').textContent='Качаю...';
   setProg(0);setStatus('Скачиваю...','load');
-  es=new EventSource('/api/prepare?url='+encodeURIComponent(u)+'&fmt='+fmt+'&quality='+quality);
+  es=new EventSource('api/prepare?url='+encodeURIComponent(u)+'&fmt='+fmt+'&quality='+quality);
   es.onmessage=ev=>{
     let d;try{d=JSON.parse(ev.data);}catch(e){return;}
     if(d.error){es.close();es=null;setStatus(d.error,'err');
@@ -504,7 +412,7 @@ $('#go').onclick=()=>{
     if(d.done){
       es.close();es=null;
       const a=document.createElement('a');
-      a.href='/api/file/'+d.job;a.download=d.filename||'download';
+      a.href='api/file/'+d.job;a.download=d.filename||'download';
       document.body.appendChild(a);a.click();a.remove();
       setProg(100);$('#pbar').classList.remove('merge');$('#ptxt').textContent='Готово';
       setStatus('Файл скачивается','ok');
@@ -516,11 +424,3 @@ $('#go').onclick=()=>{
 };
 </script>
 </body></html>"""
-
-
-if __name__ == "__main__":
-    ensure_ffmpeg()
-    ensure_deno()
-    port = int(os.environ.get("SERVER_PORT") or os.environ.get("PORT") or 25748)
-    print(f"[start] слушаю 0.0.0.0:{port}", flush=True)
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
