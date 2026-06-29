@@ -17,6 +17,9 @@ from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Streamin
 import yt_dlp
 
 from shared import binaries
+from shared.log import get_logger
+
+log = get_logger("yt")
 
 router = APIRouter()
 
@@ -124,11 +127,13 @@ async def prepare(url: str, fmt: str = "video", quality: str = "720"):
 
     def worker():
         try:
+            log.info("запрос %s [%s/%s]", url, fmt, quality)
             with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True, "noplaylist": True,
                                    "remote_components": ["ejs:github"]}) as ydl:
                 meta = ydl.extract_info(url, download=False)
             dur = meta.get("duration") or 0
             if dur > MAX_DURATION:
+                log.info("отказ: длительность %ss > лимита", dur)
                 loop.call_soon_threadsafe(queue.put_nowait, {
                     "error": f"Видео длиннее {MAX_DURATION // 60} минут — лимит сервиса"})
                 return
@@ -137,12 +142,15 @@ async def prepare(url: str, fmt: str = "video", quality: str = "720"):
                 ydl.extract_info(url, download=True)
             files = [p for p in job.iterdir() if p.is_file()]
             if not files:
+                log.warning("файл не создан для %s", url)
                 loop.call_soon_threadsafe(queue.put_nowait, {"error": "Файл не создан"})
                 return
             f = max(files, key=lambda p: p.stat().st_size)
+            log.info("готово: %s", f.name)
             loop.call_soon_threadsafe(queue.put_nowait,
                                       {"done": True, "job": job.name, "filename": f.name})
         except Exception as e:
+            log.error("ошибка скачивания %s: %s", url, str(e)[:200])
             shutil.rmtree(job, ignore_errors=True)
             loop.call_soon_threadsafe(queue.put_nowait, {"error": str(e)[:300]})
         finally:
